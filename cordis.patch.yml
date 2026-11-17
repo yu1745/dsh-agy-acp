@@ -1,6 +1,6 @@
 - insert:
     - id: yu-google-acp
-      name: '@yu1745/dsh-agy-acp/google-acp'
+      name: '@yu1745/dsh-agy-acp'
       config:
         command: agy
         args: [acp]
