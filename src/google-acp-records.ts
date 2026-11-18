@@ -11,17 +11,9 @@ export type SessionRecordWriter = (
 export const appendAcpRecord: SessionRecordWriter = (session, type, data) =>
   (appendPluginRecord as SessionRecordWriter)(session, type, data);
 
-/** Resolve the host's exact installation: the record commit uses a private
- * Session class field and cannot be called across duplicate installed copies.
- */
+/** Keep the profile loader's Session identity for private record commits. */
 export async function hostAcpRecordWriter(): Promise<SessionRecordWriter> {
-  const entry = process.argv[1];
-  if (!entry || !isAbsolute(entry)) return appendAcpRecord;
-  const require = createRequire(pathToFileURL(entry));
-  const host = await import(
-    pathToFileURL(require.resolve("@deepseek-ai/dsh-session")).href
-  );
-  return (session, type, data) => host.appendPluginRecord(session, type, data);
+  return appendAcpRecord;
 }
 
 /** Use the running harness's package version, including its class identities. */
