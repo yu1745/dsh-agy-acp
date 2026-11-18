@@ -162,6 +162,9 @@ export function acpToolBlock(call: NativeTool, seq: number) {
     typeof output.exit_code === "number"
   )
     texts = [`${texts.join("\n")}\n[exit code: ${output.exit_code}]`];
+  if (call.status === "incomplete") {
+    texts.push("ACP 未返回工具的最终状态。");
+  }
   return {
     kind: "tool-result" as const,
     seq,
@@ -175,7 +178,7 @@ export function acpToolBlock(call: NativeTool, seq: number) {
     meta,
     content: texts.map((text) => ({ type: "text" as const, text })),
     isError: call.status !== "completed",
-    ...(call.status === "cancelled" || call.status === "incomplete"
+    ...(call.status === "cancelled"
       ? { error: { name: "AbortError", code: "ABORTED" } }
       : {}),
   };
