@@ -21,7 +21,6 @@ import { acpTokenUsage } from "./google-acp-usage.js";
 import { ACP_NOTICE, NativeSessionUpdates } from "./google-acp-session.js";
 import {
   appendAcpRecord,
-  hostAcpRecordWriter,
   type SessionRecordWriter,
 } from "./google-acp-records.js";
 import { DshMcpBridge, selectMcpTools } from "./google-acp-mcp.js";
@@ -1475,8 +1474,7 @@ export async function apply(ctx: any, config: ConfigValue) {
   const projection = await ctx.sessionProjections.register(
     acpProjection as any,
   );
-  const writeRecord = await hostAcpRecordWriter();
-  const adapter = new GoogleAcpAdapter(ctx, config, projection, writeRecord);
+  const adapter = new GoogleAcpAdapter(ctx, config, projection);
   ctx.reflect.provide("yuGoogleAcp", adapter);
   ctx.llm.registerAdapter([ACP_PROVIDER], adapter);
   ctx.on("agent/request", async (payload: any, next: () => any) => {
@@ -1500,7 +1498,7 @@ export async function apply(ctx: any, config: ConfigValue) {
             text: "请先停止当前任务，再重置 ACP 上下文。",
           };
         adapter.closeSession(agent);
-        writeRecord(agent.session, ACP_BINDING, { reset: true });
+        appendAcpRecord(agent.session, ACP_BINDING, { reset: true });
         return {
           kind: "success",
           text: "下次 Google ACP 回复将新建原生会话，只发送新的用户任务；旧原生会话和本地调用记录保留。",

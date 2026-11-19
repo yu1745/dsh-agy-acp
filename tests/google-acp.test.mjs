@@ -1428,6 +1428,29 @@ test("unsupported images and headless runtime flags cannot silently change the s
     await assert.rejects(() => apply({}, { args }), /official agy acp/);
 });
 
+test("plugin activation and reset use the profile Session writer independently of the launcher path", async () => {
+  const commands = new Map();
+  const session = Session.create("acp-profile-reset");
+  const launcher = process.argv[1];
+  try {
+    process.argv[1] = join(await mkdtemp(join(tmpdir(), "acp-launcher-")), "bin.js");
+    await apply({
+      sessionProjections: { register: async () => ({}) },
+      reflect: { provide() {} },
+      llm: { registerAdapter() {} },
+      on() {},
+      inject(_services, ready) {
+        ready({ commands: { register: (command) => commands.set(command.name, command) } });
+      },
+    }, { args: ["acp"] });
+    const result = commands.get("google-acp-reset").handler({ agent: { id: session.id, session, status: "idle" } });
+    assert.equal(result.kind, "success");
+    assert.deepEqual(session.snapshotEvents().at(-1)?.data, { reset: true });
+  } finally {
+    process.argv[1] = launcher;
+  }
+});
+
 test("startup and model-selection occupancy updates are retained without inventing billing usage", async () => {
   const h = harness("session-metadata");
   try {
