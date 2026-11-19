@@ -105,6 +105,65 @@ lines.on("line", async (line) => {
       pendingPrompt = null;
     }
   } else if (m.method === "session/prompt") {
+    if (scenario === "steering-during-settlement" || scenario === "steering-stop") {
+      const text = m.params.prompt[0]?.text;
+      if (text === "Hello") {
+        update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Initial reply." } });
+        result({ stopReason: "end_turn" });
+      } else if (scenario === "steering-stop") {
+        result({ stopReason: "max_tokens" });
+      } else if (text === "first steering") {
+        result({ stopReason: "end_turn" });
+      } else if (text === "second steering") {
+        setTimeout(() => {
+          update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Both updates handled." } });
+          result({ stopReason: "end_turn" });
+        }, 240);
+      } else process.exit(24);
+      return;
+    }
+    if (scenario.startsWith("late-after-end-turn")) {
+      const text = (text) => update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+      const usage = () => update({ sessionUpdate: "usage_update", used: 100, size: 1000 });
+      if (scenario === "late-after-end-turn-daemon") {
+        update({ sessionUpdate: "tool_call", toolCallId: "daemon", kind: "execute", status: "in_progress", rawInput: { IsDaemon: true } });
+      }
+      text("Early reply. ");
+      result({ stopReason: "end_turn" });
+      if (scenario === "late-after-end-turn-daemon") return;
+      if (scenario === "late-after-end-turn-cancel") return;
+      if (scenario === "late-after-end-turn-close") {
+        setTimeout(() => process.exit(23), 15);
+        return;
+      }
+      if (scenario === "late-after-end-turn-question") {
+        pendingPrompt = m;
+        setTimeout(() => send({
+          id: "elicitation-1",
+          method: "elicitation/create",
+          params: {
+            sessionId: "native-session",
+            mode: "form",
+            requestedSchema: { type: "object", properties: { q: { type: "string", title: "Confirm" } } },
+          },
+        }), 25);
+        return;
+      }
+      usage();
+      setTimeout(() => {
+        update({ sessionUpdate: "tool_call", toolCallId: "late-edit", kind: "edit", status: "pending" });
+        setTimeout(() => {
+          update({ sessionUpdate: "tool_call_update", toolCallId: "late-edit", status: "completed" });
+          text("Interim reply. ");
+          usage();
+          setTimeout(() => {
+            text("Final reply.");
+            usage();
+          }, 130);
+        }, 210);
+      }, 25);
+      return;
+    }
     if (scenario === "steering") {
       if (!pendingPrompt) {
         pendingPrompt = m;
@@ -161,7 +220,7 @@ lines.on("line", async (line) => {
         setTimeout(() => {
           update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done." } });
           update({ sessionUpdate: "usage_update", used: 100, size: 1000 });
-        }, 3100);
+        }, 90);
       }, 50);
       return;
     }

@@ -157,23 +157,6 @@ export function isDaemonToolCall(call: NativeTool): boolean {
   return isPlainObject(call.rawInput) && call.rawInput.IsDaemon === true;
 }
 
-export function isWaitableBackgroundCall(call: NativeTool): boolean {
-  if (
-    call.origin !== "Antigravity" ||
-    call.status !== "in_progress" ||
-    call.endedAt !== undefined ||
-    isDaemonToolCall(call)
-  )
-    return false;
-  const input = call.rawInput;
-  if (call.kind === "execute") return true;
-  if (!isPlainObject(input)) return false;
-  if (typeof input.Script === "string" || typeof input.ScriptPath === "string")
-    return true;
-  if (typeof input.DurationSeconds === "number") return true;
-  return false;
-}
-
 function bounded(value: unknown): unknown {
   const encoded = JSON.stringify(value);
   if (encoded === undefined) return undefined;
@@ -249,8 +232,10 @@ export class NativeToolRecorder {
   has(id: string): boolean {
     return this.calls.has(id);
   }
-  hasActiveBackgroundCalls(): boolean {
-    return [...this.calls.values()].some(isWaitableBackgroundCall);
+  hasForegroundCalls(): boolean {
+    return [...this.calls.values()].some(
+      (call) => call.endedAt === undefined && !isDaemonToolCall(call),
+    );
   }
   hasOpenCalls(): boolean {
     return [...this.calls.values()].some((call) => call.endedAt === undefined);

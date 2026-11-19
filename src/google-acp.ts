@@ -18,7 +18,11 @@ import {
   parseAcpElicitation,
 } from "./google-acp-elicitation.js";
 import { acpTokenUsage } from "./google-acp-usage.js";
-import { ACP_NOTICE, NativeSessionUpdates } from "./google-acp-session.js";
+import {
+  ACP_NOTICE,
+  NativeSessionUpdates,
+  nativeUsageSchema,
+} from "./google-acp-session.js";
 import {
   appendAcpRecord,
   type SessionRecordWriter,
@@ -39,6 +43,7 @@ import {
   ACP_BINDING,
   NativeToolRecorder,
   NativeMessageRecorder,
+  isDaemonToolCall,
   acpProjection,
   type AcpState,
 } from "./google-acp-state.js";
@@ -114,6 +119,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
     public config: ConfigValue,
     private projection: { stateOf: (session: any) => AcpState },
     private writeRecord: SessionRecordWriter = appendAcpRecord,
+    private quietMs = { normal: 8_000, continued: 45_000 },
   ) {
     super();
   }
@@ -468,6 +474,8 @@ export class GoogleAcpAdapter extends LlmAdapter {
     let accepted = false;
     let retainConnection = false;
     let stopSteering: (() => void) | undefined;
+    let stopSettlement: (() => void) | undefined;
+    let startClientWork = () => () => {};
     let cancelTimer: ReturnType<typeof setTimeout> | undefined;
     const cancel = () => {
       if (!rpc) return;
@@ -553,6 +561,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
       if (schemas.length) {
         const invoke = async (name: string, args: any) => {
           controller.signal.throwIfAborted();
+          const endWork = startClientWork();
           const id = `extension-${randomUUID()}`;
           try {
             const batch = await this.ctx.tools.execute({
@@ -596,8 +605,8 @@ export class GoogleAcpAdapter extends LlmAdapter {
                 text: "This tool requests that this turn now conclude. Return your final response without further tools.",
               });
             return { content, isError: result.isError };
-          } catch (e) {
-            throw e;
+          } finally {
+            endWork();
           }
         };
         bridge = live?.bridge;
@@ -659,13 +668,125 @@ export class GoogleAcpAdapter extends LlmAdapter {
         options.model,
         options.reasoningEffort,
       );
-      const queue = new AsyncQueue<any>();
+      type PromptResult = { stopReason?: string; usage?: unknown } | null;
+      type Terminal =
+        | { type: "done"; result: PromptResult; confirmed: boolean }
+        | { type: "error"; error: unknown };
+      type Delta = { type: "delta"; kind: "text" | "reasoning"; text: string };
+      const queue = new AsyncQueue<Terminal | Delta>();
       let detached = false;
       let segmentTimer: ReturnType<typeof setTimeout> | undefined;
+      let quietTimer: ReturnType<typeof setTimeout> | undefined;
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      let finished = false;
+      let transportError: Error | undefined;
+      let pendingPrompts = 0;
+      let clientWork = 0;
+      let steeringCount = 0;
+      let primary: PromptResult = null;
+      let steeringStop: { result: PromptResult } | undefined;
+      let lastOutput: "text" | "reasoning" | undefined;
+      let continued = false;
+      let lastActivity = performance.now();
+      const disposeSettlement = () => {
+        finished = true;
+        clearTimeout(quietTimer);
+        clearTimeout(deadline);
+        controller.signal.removeEventListener("abort", onAbort);
+      };
+      stopSettlement = disposeSettlement;
+      const conclude = (item: Terminal) => {
+        if (finished) return;
+        disposeSettlement();
+        stopSteering?.();
+        stopSteering = undefined;
+        queue.push(item);
+      };
+      const onAbort = () => {
+        if (!pendingPrompts) {
+          // There is no outstanding RPC to acknowledge the cancellation.
+          conclude({
+            type: "done",
+            result: { stopReason: "cancelled" },
+            confirmed: false,
+          });
+        }
+      };
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+      const checkQuiet = () => {
+        clearTimeout(quietTimer);
+        if (
+          finished || !deadline || pendingPrompts || clientWork || recorder!.hasForegroundCalls()
+        ) return;
+        const duration = continued || steeringCount || lastOutput !== "text"
+          ? this.quietMs.continued
+          : this.quietMs.normal;
+        // Leave time to drain even when a profile has a short ACP deadline.
+        const quietWindow = Math.min(duration, this.config.requestTimeoutMs / 2);
+        const remaining = quietWindow - (performance.now() - lastActivity);
+        if (remaining > 0) quietTimer = setTimeout(checkQuiet, Math.ceil(remaining));
+        else conclude({ type: "done", result: primary, confirmed: true });
+      };
+      const noteActivity = (work: boolean) => {
+        if (finished) return;
+        if (deadline && work) continued = true;
+        lastActivity = performance.now();
+        checkQuiet();
+      };
+      startClientWork = () => {
+        if (finished) return () => {};
+        clientWork++;
+        noteActivity(true);
+        return () => {
+          clientWork--;
+          noteActivity(true);
+        };
+      };
+      const trackPrompt = (response: Promise<PromptResult>, steering: boolean) => {
+        pendingPrompts++;
+        noteActivity(steering);
+        void response.then(
+          (result) => {
+            if (finished) return;
+            pendingPrompts--;
+            if (!steering) primary = result;
+            else if (result?.stopReason !== "end_turn") steeringStop ??= { result };
+            if (pendingPrompts) return;
+            const stop = steeringStop ? steeringStop.result : primary;
+            const reason = stop?.stopReason;
+            if (controller.signal.aborted || reason !== "end_turn") {
+              const confirmed = reason === "cancelled"
+                ? !deadline
+                : !controller.signal.aborted &&
+                  ["max_tokens", "max_turn_requests", "refusal"].includes(reason ?? "");
+              conclude({ type: "done", result: stop, confirmed });
+              return;
+            }
+            // agy can acknowledge a prompt while more native work is on its way.
+            // The context usage gauge is also emitted for intermediate work.
+            deadline ??= setTimeout(() => {
+              conclude({
+                type: "error",
+                error: new LlmError(
+                  "等待 Antigravity 确认回合结束超时，原生任务可能尚未完成。",
+                  "ACP_SETTLE_TIMEOUT",
+                ),
+              });
+            }, this.config.requestTimeoutMs);
+            noteActivity(false);
+          },
+          (error) => conclude({ type: "error", error }),
+        );
+      };
       const receiveTool = (update: any, origin?: "Antigravity" | "DSH · MCP") => {
         const owner = [...recorders].find((candidate) => candidate.has(update.toolCallId)) ?? recorder!;
         if (owner === recorder) messageRecorder!.tool(update.toolCallId);
-        return owner.update(update, origin);
+        const call = owner.update(update, origin);
+        if (owner === recorder && call) {
+          if (isDaemonToolCall(call)) checkQuiet();
+          else noteActivity(true);
+        }
+        return call;
       };
       const release = (closing = false) => {
         clearTimeout(segmentTimer);
@@ -680,10 +801,13 @@ export class GoogleAcpAdapter extends LlmAdapter {
       recorders.add(recorder);
       const transport = { rpc, cwd, sessionId: nativeSessionId, owner: agent, init, session, bridge, recorders, release };
       this.live.set(agent.id, transport);
-      rpc.onClose = () => {
+      rpc.onClose = (error) => {
         this.connections.delete(transport.rpc);
         if (this.live.get(agent.id) === transport) this.live.delete(agent.id);
-        if (detached) {
+        if (!detached) {
+          transportError = error;
+          conclude({ type: "error", error });
+        } else {
           try {
             release(true);
           } catch (error) {
@@ -709,6 +833,9 @@ export class GoogleAcpAdapter extends LlmAdapter {
           return;
         const u = params.update;
         nativeUpdates.receive(params);
+        if (u?.sessionUpdate === "usage_update" && nativeUsageSchema.safeParse(u).success)
+          noteActivity(false);
+        if (u?.sessionUpdate === "plan" && Array.isArray(u.entries)) noteActivity(true);
         if (detached && u?.sessionUpdate === "usage_update") {
           clearTimeout(segmentTimer);
           messageRecorder!.finish();
@@ -743,10 +870,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
           agent.session.append("todo/write", { todos });
         }
         const compaction = nativeUpdates.compaction(u);
-        if (compaction) {
-          messageRecorder!.tool(compaction.toolCallId);
-          recorder!.update(compaction);
-        }
+        if (compaction) receiveTool(compaction);
         if (
           u?.sessionUpdate === "tool_call" ||
           u?.sessionUpdate === "tool_call_update"
@@ -762,7 +886,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
           } catch (error) {
             if (detached) rpc?.close();
             else {
-              queue.push({ type: "error", error });
+              conclude({ type: "error", error });
               cancel();
             }
           }
@@ -770,12 +894,10 @@ export class GoogleAcpAdapter extends LlmAdapter {
           ["agent_message_chunk", "agent_thought_chunk"].includes(
             u?.sessionUpdate,
           ) &&
-          u.content?.type === "text"
+          u.content?.type === "text" && typeof u.content.text === "string" && u.content.text
         ) {
-          messageRecorder!.delta(
-            u.sessionUpdate === "agent_thought_chunk" ? "reasoning" : "text",
-            u.content.text,
-          );
+          const kind = u.sessionUpdate === "agent_thought_chunk" ? "reasoning" : "text";
+          messageRecorder!.delta(kind, u.content.text);
           if (detached) {
             clearTimeout(segmentTimer);
             segmentTimer = setTimeout(() => {
@@ -789,15 +911,12 @@ export class GoogleAcpAdapter extends LlmAdapter {
             segmentTimer.unref();
             return;
           }
-          queue.push({
-            type: "delta",
-            kind:
-              u.sessionUpdate === "agent_thought_chunk" ? "reasoning" : "text",
-            text: u.content.text,
-          });
+          lastOutput = kind;
+          noteActivity(true);
+          queue.push({ type: "delta", kind, text: u.content.text });
         }
       };
-      rpc.onRequest = async (method, params) => {
+      const receiveRequest = async (method: string, params: any) => {
         if (detached && !isLiveOwner()) throw new AcpRpcError("ACP session owner is unavailable", -32601);
         if (method === "elicitation/create" && params?.sessionId === nativeSessionId) {
           const plan = parseAcpElicitation(params);
@@ -934,6 +1053,17 @@ export class GoogleAcpAdapter extends LlmAdapter {
           ? { outcome: { outcome: "selected", optionId: selected.optionId } }
           : { outcome: { outcome: "cancelled" } };
       };
+      rpc.onRequest = async (method, params) => {
+        if (params?.sessionId !== nativeSessionId ||
+          !["elicitation/create", "session/request_permission"].includes(method))
+          return receiveRequest(method, params);
+        const endWork = startClientWork();
+        try {
+          return await receiveRequest(method, params);
+        } finally {
+          endWork();
+        }
+      };
       if (nativeModel) {
         await rpc.request("session/set_model", {
           sessionId: nativeSessionId,
@@ -956,15 +1086,15 @@ export class GoogleAcpAdapter extends LlmAdapter {
       };
       this.writeRecord(agent.session, ACP_BINDING, binding);
       accepted = true;
-      const task = rpc.request(
+      trackPrompt(rpc.request(
         "session/prompt",
         { sessionId: nativeSessionId, prompt },
         this.config.requestTimeoutMs,
-      );
-      const steering = new Set<Promise<any>>();
+      ), false);
       let submissions = Promise.resolve();
       const sendSteering = ({ agent: owner, message }: any) => {
         if (
+          finished ||
           owner?.id !== agent.id ||
           controller.signal.aborted ||
           !isUserTask(message) ||
@@ -979,11 +1109,12 @@ export class GoogleAcpAdapter extends LlmAdapter {
             steered: [...binding.steered, entry],
           });
         } catch (error) {
-          queue.push({ type: "error", error });
+          conclude({ type: "error", error });
           cancel();
           return;
         }
         binding.steered.push(entry);
+        steeringCount++;
         const submitted = submissions.then(async () => {
           const extra = await this.preparePrompt([message], controller.signal);
           controller.signal.throwIfAborted();
@@ -1012,12 +1143,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
           () => {},
           () => {},
         );
-        const delivery = submitted.then(({ completion }) => completion);
-        steering.add(delivery);
-        void delivery.catch((error) => {
-          queue.push({ type: "error", error });
-          cancel();
-        });
+        trackPrompt(submitted.then(({ completion }) => completion), true);
       };
       if (this.ctx.on) {
         const inserted = this.ctx.on("agent/inbox/inserted", sendSteering);
@@ -1030,7 +1156,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
               !binding.steered.some((m) => m.id === message.id)
             )
               return;
-            queue.push({
+            conclude({
               type: "error",
               error: new LlmError(
                 "已提交给 ACP 的插话被修改或移除，无法撤回原生上下文。请新建会话或执行 /google-acp-reset。",
@@ -1047,67 +1173,6 @@ export class GoogleAcpAdapter extends LlmAdapter {
       }
       for (const message of agent.inbox?.nextStep ?? [])
         sendSteering({ agent, message });
-      void task.then(
-        async (result) => {
-          try {
-            let size;
-            do {
-              size = steering.size;
-              await Promise.all(steering);
-            } while (size !== steering.size);
-            stopSteering?.();
-            stopSteering = undefined;
-            if (result?.stopReason === "end_turn" && recorder?.hasActiveBackgroundCalls() && !controller.signal.aborted) {
-              await new Promise<void>((resolve, reject) => {
-                const connection = rpc!;
-                const onNotification = connection.onNotification;
-                const previousClose = connection.onClose;
-                let quiet: ReturnType<typeof setTimeout> | undefined;
-                let wakeReply = false;
-                const cleanup = () => {
-                  clearTimeout(deadline);
-                  clearTimeout(quiet);
-                  connection.onNotification = onNotification;
-                  connection.onClose = previousClose;
-                  controller.signal.removeEventListener("abort", finish);
-                };
-                const finish = () => {
-                  cleanup();
-                  resolve();
-                };
-                // Keep the foreground turn bounded. The session listener stays
-                // attached after this wait, including when the tool is still running.
-                const deadline = setTimeout(finish, this.config.requestTimeoutMs);
-                connection.onClose = (error) => {
-                  cleanup();
-                  reject(error);
-                  previousClose(error);
-                };
-                controller.signal.addEventListener("abort", finish, { once: true });
-                connection.onNotification = (method, params) => {
-                  onNotification(method, params);
-                  if (method !== "session/update" || params?.sessionId !== nativeSessionId) return;
-                  const update = params.update?.sessionUpdate;
-                  if (update === "agent_message_chunk" && !recorder?.hasActiveBackgroundCalls()) wakeReply = true;
-                  if (update === "usage_update" && wakeReply && !recorder?.hasActiveBackgroundCalls()) {
-                    finish();
-                    return;
-                  }
-                  if (!["tool_call", "tool_call_update", "agent_message_chunk", "agent_thought_chunk"].includes(update)) return;
-                  clearTimeout(quiet);
-                  // agy usually reports usage after its wake reply. With no
-                  // usage signal, release the foreground after a quiet period.
-                  if (!recorder?.hasActiveBackgroundCalls()) quiet = setTimeout(finish, 15_000);
-                };
-              });
-            }
-            queue.push({ type: "done", result });
-          } catch (error) {
-            queue.push({ type: "error", error });
-          }
-        },
-        (error) => queue.push({ type: "error", error }),
-      );
       let index = -1;
       let current: { type: "text" | "reasoning"; text: string } | undefined;
       let visibleText = "";
@@ -1130,18 +1195,18 @@ export class GoogleAcpAdapter extends LlmAdapter {
         if (current) yield { type: "block-end", index, block: current };
         if (item.type === "error") throw item.error;
         const stop = item.result?.stopReason;
+        if (stop === "end_turn" && transportError && !controller.signal.aborted)
+          throw transportError;
         messageRecorder.finish(
           stop === "cancelled" || controller.signal.aborted
             ? "interrupted"
             : "settled",
         );
-        this.writeRecord(agent.session, ACP_BINDING, {
-          ...binding,
-          bad: false,
-        });
-        accepted = false;
-        const usage =
-          steering.size === 0 ? acpTokenUsage(item.result?.usage) : undefined;
+        if (item.confirmed && (!controller.signal.aborted || stop === "cancelled")) {
+          this.writeRecord(agent.session, ACP_BINDING, { ...binding, bad: false });
+          accepted = false;
+        }
+        const usage = steeringCount === 0 ? acpTokenUsage(item.result?.usage) : undefined;
         if (usage) yield { type: "usage", usage };
         if (
           /service has been disabled in this account|account (?:has been |is )?(?:suspended|disabled)/i.test(
@@ -1188,7 +1253,9 @@ export class GoogleAcpAdapter extends LlmAdapter {
       }
     } catch (error) {
       messageRecorder?.finish("interrupted");
-      recorder?.finish(controller.signal.aborted ? "cancelled" : "failed");
+      const settlementTimedOut = error instanceof LlmError && error.code === "ACP_SETTLE_TIMEOUT";
+      const status = controller.signal.aborted ? "cancelled" : settlementTimedOut ? "incomplete" : "failed";
+      recorder?.finish(status);
       if (error instanceof AcpRpcError && error.code === -32000)
         throw new LlmError(
           "Google sign-in required. Run agy acp --login with your subscription account.",
@@ -1196,6 +1263,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
         );
       throw error;
     } finally {
+      stopSettlement?.();
       stopSteering?.();
       messageRecorder?.finish("interrupted");
       // Early iterator return cancels the whole native turn, including its tools.

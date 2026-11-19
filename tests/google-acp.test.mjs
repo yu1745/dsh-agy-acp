@@ -34,7 +34,7 @@ const fixture = fileURLToPath(
 );
 const cwd = fileURLToPath(new URL("..", import.meta.url));
 
-function harness(scenario = "normal", mcpTools = [], credentialStore = "auto") {
+function harness(scenario = "normal", mcpTools = [], credentialStore = "auto", quietMs = { normal: 35, continued: 160 }) {
   let state = acpProjection.init();
   const events = [],
     calls = [];
@@ -116,6 +116,7 @@ function harness(scenario = "normal", mcpTools = [], credentialStore = "auto") {
     },
     { stateOf: () => state },
     (session, type, data) => session.append(type, data),
+    quietMs,
   );
   const options = {
     provider: ACP_PROVIDER,
@@ -504,15 +505,132 @@ test("background tools and model output can settle after ACP end_turn", async ()
     h.adapter.dispose();
   }
 });
-test("background calls remain in progress after the DSH foreground deadline", async () => {
+test("an unconfirmed foreground deadline fails without clearing the uncertain binding", async () => {
   const h = harness("background-after-end-turn-timeout");
-  h.adapter.config.requestTimeoutMs = 1000;
+  h.adapter.config.requestTimeoutMs = 220;
   try {
-    await collect(h.adapter.stream(h.options));
+    await assert.rejects(() => collect(h.adapter.stream(h.options)), { code: "ACP_SETTLE_TIMEOUT" });
+    assert.equal(h.state().calls.find((call) => call.id === "background").status, "incomplete");
+    assert.equal(h.state().binding.bad, true);
+    assert.equal(h.adapter.connections.size, 0);
+  } finally {
+    h.adapter.dispose();
+  }
+});
+
+test("late pending edits and intermediate usage do not close the foreground before the final reply", async () => {
+  const h = harness("late-after-end-turn", [], "auto", { normal: 100, continued: 175 });
+  try {
+    const chunks = await collect(h.adapter.stream(h.options));
     h.agent.session.append("turn/end", { turn: 1, reason: { kind: "completed" } });
-    assert.equal(h.state().calls.find((call) => call.id === "background").status, "in_progress");
-    assert.equal(h.state().runningTurn, null);
+    assert.equal(chunks.filter((chunk) => chunk.type === "text-delta").map((chunk) => chunk.text).join(""),
+      "Early reply. Interim reply. Final reply.");
+    const edit = h.state().calls.find((call) => call.id === "late-edit");
+    assert.equal(edit.status, "completed");
+    assert.equal(edit.survivesHostTurn, undefined);
+    assert.equal(h.state().binding.bad, false);
+    assert.equal(h.events.at(-3).type, ACP_MESSAGE);
+    assert.equal(h.events.at(-3).data.end, "settled");
+  } finally {
+    h.adapter.dispose();
+  }
+});
+
+for (const [scenario, expected] of [["steering-during-settlement", "stop"], ["steering-stop", "max-tokens"]]) {
+  test(`${scenario} keeps accepting steering until the foreground settles`, async () => {
+    const h = harness(scenario, [], "auto", { normal: 100, continued: 175 });
+    let inserted;
+    h.agent.inbox = { nextStep: [] };
+    h.ctx.on = (event, listener) => {
+      if (event !== "agent/inbox/inserted") return () => {};
+      inserted = listener;
+      return () => { inserted = undefined; };
+    };
+    try {
+      const stream = h.adapter.stream(h.options);
+      assert.equal((await stream.next()).value.type, "block-start");
+      assert.equal((await stream.next()).value.text, "Initial reply.");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      for (const text of ["first steering", "second steering"]) {
+        const message = { id: text, role: "user", content: [{ type: "text", text }] };
+        h.agent.inbox.nextStep.push(message);
+        inserted?.({ agent: h.agent, message });
+      }
+      const chunks = await collect(stream);
+      assert.equal(chunks.at(-1).reason.kind, expected);
+      if (expected === "stop") assert.ok(chunks.some((chunk) => chunk.text === "Both updates handled."));
+      assert.equal(h.state().binding.steered.length, 2);
+      assert.equal(inserted, undefined);
+    } finally {
+      h.adapter.dispose();
+    }
+  });
+}
+
+test("a late native question without a tool ID keeps the turn open until answered", async () => {
+  const h = harness("late-after-end-turn-question", [], "auto", { normal: 100, continued: 175 });
+  h.ctx.get = (name) => name === "userQuestions" ? {
+    ask: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 210));
+      return { answers: [{ id: "q", custom: "Confirmed" }] };
+    },
+  } : undefined;
+  try {
+    const chunks = await collect(h.adapter.stream(h.options));
+    assert.equal(chunks.at(-1).reason.kind, "stop");
+    assert.ok(chunks.some((chunk) => chunk.text?.includes("Confirmed")));
+    assert.equal(h.state().binding.bad, false);
+  } finally {
+    h.adapter.dispose();
+  }
+});
+
+test("a shorter ACP deadline still permits a quiet successful turn", async () => {
+  const h = harness("normal", [], "auto", { normal: 400, continued: 500 });
+  h.adapter.config.requestTimeoutMs = 220;
+  try {
+    assert.equal((await collect(h.adapter.stream(h.options))).at(-1).reason.kind, "stop");
+  } finally {
+    h.adapter.dispose();
+  }
+});
+
+test("a declared daemon can keep running after the foreground finishes", async () => {
+  const h = harness("late-after-end-turn-daemon");
+  try {
+    assert.equal((await collect(h.adapter.stream(h.options))).at(-1).reason.kind, "stop");
+    const daemon = h.state().calls.find((call) => call.id === "daemon");
+    assert.equal(daemon.status, "in_progress");
+    assert.equal(daemon.survivesHostTurn, true);
     assert.equal(h.adapter.connections.size, 1);
+  } finally {
+    h.adapter.dispose();
+  }
+});
+
+test("cancelling after end_turn closes the connection without confirming uncertain native work", async () => {
+  const h = harness("late-after-end-turn-cancel", [], "auto", { normal: 200, continued: 250 });
+  const abort = new AbortController();
+  try {
+    const stream = h.adapter.stream({ ...h.options, signal: abort.signal });
+    await stream.next();
+    assert.equal((await stream.next()).value.text, "Early reply. ");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    abort.abort();
+    assert.equal((await collect(stream)).at(-1).reason.kind, "aborted");
+    assert.equal(h.state().binding.bad, true);
+    assert.equal(h.adapter.connections.size, 0);
+  } finally {
+    h.adapter.dispose();
+  }
+});
+
+test("transport exit during settlement fails the turn and preserves the uncertain binding", async () => {
+  const h = harness("late-after-end-turn-close", [], "auto", { normal: 200, continued: 250 });
+  try {
+    await assert.rejects(() => collect(h.adapter.stream(h.options)), /exited \(23\)/);
+    assert.equal(h.state().binding.bad, true);
+    assert.equal(h.adapter.connections.size, 0);
   } finally {
     h.adapter.dispose();
   }
