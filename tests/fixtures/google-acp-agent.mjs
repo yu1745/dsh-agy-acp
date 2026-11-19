@@ -64,6 +64,7 @@ lines.on("line", async (line) => {
     if (m.params.methodId !== "oauth-personal") process.exit(8);
     result({});
   } else if (m.method === "session/new" || m.method === "session/resume") {
+    if (scenario === "idle-wake" && m.method === "session/resume") process.exit(21);
     if (scenario.startsWith("session-")) {
       update({ sessionUpdate: "usage_update", used: 12000, size: 100000 });
       update({
@@ -123,13 +124,44 @@ lines.on("line", async (line) => {
       return;
     }
     pendingPrompt = m;
-    if (scenario === "background-after-end-turn") {
+    if (scenario === "idle-wake") {
+      if (m.params.prompt[0]?.text === "next task") {
+        update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Same transport." } });
+        result({ stopReason: "end_turn" });
+        return;
+      }
+      update({ sessionUpdate: "tool_call", toolCallId: "monitor", kind: "other", status: "completed" });
+      update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Monitor registered." } });
+      result({ stopReason: "end_turn" });
+      setTimeout(() => {
+        send({
+          id: "permission-1",
+          method: "session/request_permission",
+          params: {
+            sessionId: "native-session",
+            toolCall: { toolCallId: "wake-read", title: "Read monitor result" },
+            options: [{ optionId: "allow", kind: "allow_once" }],
+          },
+        });
+        permission = (reply) => {
+          update({ sessionUpdate: "tool_call_update", toolCallId: "wake-read", status: "completed" });
+          update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: reply?.outcome?.optionId === "allow" ? "Monitor woke." : "Monitor denied." } });
+          update({ sessionUpdate: "usage_update", used: 100, size: 1000 });
+        };
+      }, 80);
+      return;
+    }
+    if (scenario.startsWith("background-after-end-turn")) {
       update({ sessionUpdate: "tool_call", toolCallId: "background", kind: "execute", status: "in_progress", rawInput: { command: "fixture" } });
       update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Still running. " } });
       result({ stopReason: "end_turn" });
+      if (scenario === "background-after-end-turn-timeout") return;
       setTimeout(() => {
         update({ sessionUpdate: "tool_call_update", toolCallId: "background", status: "completed" });
-        update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done." } });
+        setTimeout(() => {
+          update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done." } });
+          update({ sessionUpdate: "usage_update", used: 100, size: 1000 });
+        }, 3100);
       }, 50);
       return;
     }

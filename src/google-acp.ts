@@ -83,6 +83,21 @@ class AsyncQueue<T> {
 export class GoogleAcpAdapter extends LlmAdapter {
   private connections = new Set<AcpConnection>();
   private active = new Set<string>();
+  private live = new Map<string, {
+    rpc: AcpConnection;
+    cwd: string;
+    sessionId: string;
+    owner: object;
+    init: any;
+    session: any;
+    bridge?: DshMcpBridge;
+    recorders: Set<NativeToolRecorder>;
+    release: (closing?: boolean) => void;
+  }>();
+  closeSession(agent: any) {
+    const live = this.live.get(agent.id);
+    if (live?.owner === agent) live.rpc.close();
+  }
   private catalog: AcpModelGroup[] = [];
   private catalogSession: any;
   private catalogTask?: Promise<void>;
@@ -452,6 +467,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
     let toolSet: any;
     let nativeSessionId: string | undefined;
     let accepted = false;
+    let retainConnection = false;
     let stopSteering: (() => void) | undefined;
     let cancelTimer: ReturnType<typeof setTimeout> | undefined;
     const cancel = () => {
@@ -473,7 +489,13 @@ export class GoogleAcpAdapter extends LlmAdapter {
           "Select a workspace before using Google ACP.",
           "ACP_WORKSPACE",
         );
-      rpc = this.connection(cwd);
+      let live = this.live.get(agent.id);
+      if (live && (live.sessionId !== previous?.nativeSessionId || live.cwd !== cwd || live.owner !== agent)) {
+        live.rpc.close();
+        live = undefined;
+      }
+      rpc = live?.rpc ?? this.connection(cwd);
+      const recorders = live?.recorders ?? new Set<NativeToolRecorder>();
       let nativeConfig: any;
       const nativeUpdates = new NativeSessionUpdates(
         (type, data) => this.writeRecord(agent.session, type, data),
@@ -484,10 +506,10 @@ export class GoogleAcpAdapter extends LlmAdapter {
           }
         },
       );
-      rpc.onNotification = (method, params) => {
+      if (!live) rpc.onNotification = (method, params) => {
         if (method === "session/update") nativeUpdates.receive(params);
       };
-      const init = await this.initialize(rpc);
+      const init = live?.init ?? await this.initialize(rpc);
       controller.signal.throwIfAborted();
       const prompt = await this.preparePrompt(pending, controller.signal);
       const invokedSkills = new Set(options.messages.flatMap((message) => {
@@ -530,7 +552,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
         );
       }
       if (schemas.length) {
-        bridge = new DshMcpBridge(schemas, async (name, args) => {
+        const invoke = async (name: string, args: any) => {
           controller.signal.throwIfAborted();
           const id = `extension-${randomUUID()}`;
           try {
@@ -578,9 +600,18 @@ export class GoogleAcpAdapter extends LlmAdapter {
           } catch (e) {
             throw e;
           }
-        });
-        await bridge.start();
+        };
+        bridge = live?.bridge;
+        if (bridge) {
+          if (JSON.stringify(bridge.tools) !== JSON.stringify(schemas))
+            throw new LlmError("DSH tool configuration changed for the live ACP session.", "ACP_TOOLS_CHANGED");
+          bridge.setInvoker(invoke);
+        } else if (!live) {
+          bridge = new DshMcpBridge(schemas, invoke);
+          await bridge.start();
+        }
       }
+      bridge ??= live?.bridge;
       const fields = {
         cwd,
         mcpServers: bridge ? [bridge.descriptor()] : [],
@@ -590,7 +621,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
           "Official ACP agent cannot resume sessions; refusing to replay the task.",
           "ACP_RESUME",
         );
-      const session = await rpc.request(
+      const session = live?.session ?? await rpc.request(
         previous ? "session/resume" : "session/new",
         {
           ...fields,
@@ -630,15 +661,59 @@ export class GoogleAcpAdapter extends LlmAdapter {
         options.reasoningEffort,
       );
       const queue = new AsyncQueue<any>();
+      let detached = false;
+      let segmentTimer: ReturnType<typeof setTimeout> | undefined;
+      const receiveTool = (update: any, origin?: "Antigravity" | "DSH · MCP") => {
+        const owner = [...recorders].find((candidate) => candidate.has(update.toolCallId)) ?? recorder!;
+        if (owner === recorder) messageRecorder!.tool(update.toolCallId);
+        return owner.update(update, origin);
+      };
+      const release = (closing = false) => {
+        clearTimeout(segmentTimer);
+        controller.abort();
+        if (detached) {
+          messageRecorder!.finish(closing ? "interrupted" : "settled");
+          if (closing) for (const recorder of recorders) recorder.finish("incomplete");
+        }
+      };
+      live?.release();
+      for (const old of recorders) if (!old.hasOpenCalls()) recorders.delete(old);
+      recorders.add(recorder);
+      const transport = { rpc, cwd, sessionId: nativeSessionId, owner: agent, init, session, bridge, recorders, release };
+      this.live.set(agent.id, transport);
+      rpc.onClose = () => {
+        this.connections.delete(transport.rpc);
+        if (this.live.get(agent.id) === transport) this.live.delete(agent.id);
+        if (detached) {
+          try {
+            release(true);
+          } catch (error) {
+            // Agent disposal can detach the session record sink before this callback.
+            this.ctx.logger?.warn?.("Failed to finalize ACP records: %s", error);
+          } finally {
+            void bridge?.close().catch(() => {});
+          }
+        }
+      };
       let blockedPermission: { code: string; message: string } | undefined;
+      const isLiveOwner = () => {
+        const sessions = this.ctx.get("sessions");
+        return this.live.get(agent.id) === transport && this.ctx.agents.get(agent.id) === agent &&
+          (!sessions?.get || sessions.get(agent.session.id) === agent.session);
+      };
       rpc.onNotification = (method, params) => {
         if (
+          (detached && !isLiveOwner()) ||
           method !== "session/update" ||
           params?.sessionId !== nativeSessionId
         )
           return;
         const u = params.update;
         nativeUpdates.receive(params);
+        if (detached && u?.sessionUpdate === "usage_update") {
+          clearTimeout(segmentTimer);
+          messageRecorder!.finish();
+        }
         if (u?.sessionUpdate === "notice" && typeof u.title === "string")
           this.writeRecord(agent.session, ACP_NOTICE, {
             nativeSessionId,
@@ -684,11 +759,13 @@ export class GoogleAcpAdapter extends LlmAdapter {
               ? "DSH · MCP"
               : "Antigravity";
           try {
-            messageRecorder!.tool(u.toolCallId);
-            recorder!.update(u, origin);
+            receiveTool(u, origin);
           } catch (error) {
-            queue.push({ type: "error", error });
-            cancel();
+            if (detached) rpc?.close();
+            else {
+              queue.push({ type: "error", error });
+              cancel();
+            }
           }
         } else if (
           ["agent_message_chunk", "agent_thought_chunk"].includes(
@@ -700,6 +777,19 @@ export class GoogleAcpAdapter extends LlmAdapter {
             u.sessionUpdate === "agent_thought_chunk" ? "reasoning" : "text",
             u.content.text,
           );
+          if (detached) {
+            clearTimeout(segmentTimer);
+            segmentTimer = setTimeout(() => {
+              if (!isLiveOwner()) return;
+              try {
+                messageRecorder!.finish();
+              } catch {
+                rpc?.close();
+              }
+            }, 120_000);
+            segmentTimer.unref();
+            return;
+          }
           queue.push({
             type: "delta",
             kind:
@@ -709,6 +799,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
         }
       };
       rpc.onRequest = async (method, params) => {
+        if (detached && !isLiveOwner()) throw new AcpRpcError("ACP session owner is unavailable", -32601);
         if (method === "elicitation/create" && params?.sessionId === nativeSessionId) {
           const plan = parseAcpElicitation(params);
           const service = this.ctx.get("userQuestions");
@@ -717,8 +808,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
           const toolCallId = params.toolCallId;
           const track = (status: string) => {
             if (typeof toolCallId === "string" && toolCallId) {
-              messageRecorder!.tool(toolCallId);
-              recorder!.update({ toolCallId, status });
+              receiveTool({ toolCallId, status });
             }
           };
           track("waiting_input");
@@ -748,9 +838,8 @@ export class GoogleAcpAdapter extends LlmAdapter {
         )
           throw new AcpRpcError("Unsupported ACP client request", -32601);
         const call = params.toolCall ?? {};
-        messageRecorder!.tool(call.toolCallId);
         if (call.toolCallId?.startsWith("interaction_")) {
-          recorder!.update({ ...call, status: "waiting_input" });
+          receiveTool({ ...call, status: "waiting_input" });
           const service = this.ctx.get("userQuestions");
           if (!service || !params.options?.length)
             return { outcome: { outcome: "cancelled" } };
@@ -777,7 +866,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
             choice?.selected?.length === 1 && !choice.custom
               ? labels.indexOf(choice.selected[0])
               : -1;
-          recorder!.update({
+          receiveTool({
             ...call,
             status: index >= 0 ? "completed" : "cancelled",
           });
@@ -790,7 +879,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
               }
             : { outcome: { outcome: "cancelled" } };
         }
-        recorder!.update({ ...call, status: "waiting_approval" });
+        receiveTool({ ...call, status: "waiting_approval" });
         const allow = params.options?.find((o: any) => o.kind === "allow_once");
         const reject = params.options?.find(
           (o: any) => o.kind === "reject_once",
@@ -800,7 +889,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
           ? "cancelled"
           : allow && preset
             ? "allowed-once"
-            : allow && this.ctx.get("approval")
+            : !detached && allow && this.ctx.get("approval")
               ? await this.ctx.get("approval").request({
                   agent,
                   toolName: call.title ?? "Antigravity tool",
@@ -821,14 +910,16 @@ export class GoogleAcpAdapter extends LlmAdapter {
               ? "此调用的审批被拒绝，操作未获执行许可。"
               : outcome === "cancelled"
                 ? "本次审批已取消，操作未获执行许可。"
-                : "本次调用没有可用的单次审批授权，操作未获执行许可。";
+                : detached
+                  ? "后台唤醒发起了新的权限请求，DSH 需要在打开的回合内审批。操作未获执行许可。"
+                  : "本次调用没有可用的单次审批授权，操作未获执行许可。";
         if (outcome !== "allowed-once")
           blockedPermission = {
             code: "ACP_PERMISSION_DENIED",
             message: `${message} 官方代理也未返回最终答复，请检查会话权限后重新发送任务。`,
           };
         const selected = outcome === "allowed-once" ? allow : reject;
-        recorder!.update({
+        receiveTool({
           ...call,
           status: outcome === "allowed-once" ? "in_progress" : "failed",
           permission: {
@@ -968,30 +1059,46 @@ export class GoogleAcpAdapter extends LlmAdapter {
             stopSteering?.();
             stopSteering = undefined;
             if (result?.stopReason === "end_turn" && recorder?.hasActiveBackgroundCalls() && !controller.signal.aborted) {
-              await new Promise<void>((resolve) => {
+              await new Promise<void>((resolve, reject) => {
                 const connection = rpc!;
                 const onNotification = connection.onNotification;
+                const previousClose = connection.onClose;
                 let quiet: ReturnType<typeof setTimeout> | undefined;
-                const finish = () => {
+                let wakeReply = false;
+                const cleanup = () => {
                   clearTimeout(deadline);
                   clearTimeout(quiet);
                   connection.onNotification = onNotification;
                   connection.onClose = previousClose;
                   controller.signal.removeEventListener("abort", finish);
+                };
+                const finish = () => {
+                  cleanup();
                   resolve();
                 };
+                // Keep the foreground turn bounded. The session listener stays
+                // attached after this wait, including when the tool is still running.
                 const deadline = setTimeout(finish, this.config.requestTimeoutMs);
-                const previousClose = connection.onClose;
                 connection.onClose = (error) => {
-                  finish();
+                  cleanup();
+                  reject(error);
                   previousClose(error);
                 };
                 controller.signal.addEventListener("abort", finish, { once: true });
                 connection.onNotification = (method, params) => {
                   onNotification(method, params);
                   if (method !== "session/update" || params?.sessionId !== nativeSessionId) return;
+                  const update = params.update?.sessionUpdate;
+                  if (update === "agent_message_chunk" && !recorder?.hasActiveBackgroundCalls()) wakeReply = true;
+                  if (update === "usage_update" && wakeReply && !recorder?.hasActiveBackgroundCalls()) {
+                    finish();
+                    return;
+                  }
+                  if (!["tool_call", "tool_call_update", "agent_message_chunk", "agent_thought_chunk"].includes(update)) return;
                   clearTimeout(quiet);
-                  if (!recorder?.hasActiveBackgroundCalls()) quiet = setTimeout(finish, 1000);
+                  // agy usually reports usage after its wake reply. With no
+                  // usage signal, release the foreground after a quiet period.
+                  if (!recorder?.hasActiveBackgroundCalls()) quiet = setTimeout(finish, 15_000);
                 };
               });
             }
@@ -1059,13 +1166,16 @@ export class GoogleAcpAdapter extends LlmAdapter {
             },
           };
         } else if (stop === "end_turn") {
-          recorder.finish("incomplete");
-          if (!visibleText.trim())
+          if (!visibleText.trim() && (blockedPermission || !recorder.hasOpenCalls()))
             throw new LlmError(
               blockedPermission?.message ??
                 "官方 ACP 代理结束了回合，但没有返回最终答复。请检查调用记录后重新发送任务。",
               blockedPermission?.code ?? "ACP_EMPTY_REPLY",
             );
+          detached = true;
+          retainConnection = this.live.get(agent.id) === transport;
+          if (retainConnection) recorder.preserveAfterTurn();
+          else recorder.finish("incomplete");
           yield { type: "finish", reason: { kind: "stop" } };
         } else if (stop === "max_tokens") {
           recorder.finish("incomplete");
@@ -1092,12 +1202,18 @@ export class GoogleAcpAdapter extends LlmAdapter {
       // Early iterator return cancels the whole native turn, including its tools.
       if (accepted && !controller.signal.aborted) controller.abort();
       controller.signal.removeEventListener("abort", cancel);
-      controller.abort();
       clearTimeout(cancelTimer);
       options.signal?.removeEventListener("abort", abort);
-      rpc?.close();
-      if (rpc) this.connections.delete(rpc);
-      await bridge?.close();
+      if (retainConnection) {
+        bridge?.setInvoker(async () => {
+          throw new Error("DSH extension tools require an active DSH turn.");
+        });
+      } else {
+        controller.abort();
+        rpc?.close();
+        if (rpc) this.connections.delete(rpc);
+        await bridge?.close();
+      }
       toolSet?.dispose();
       this.active.delete(agent.id);
     }
@@ -1129,6 +1245,9 @@ export class GoogleAcpAdapter extends LlmAdapter {
       let rpc: AcpConnection | undefined;
       let cancelTimer: ReturnType<typeof setTimeout> | undefined;
       let started = false;
+      const live = this.live.get(agent.id);
+      const reuse = live?.owner === agent && live.sessionId === binding.nativeSessionId ? live : undefined;
+      let restore: (() => void) | undefined;
       const cancel = () => {
         rpc?.notify("session/cancel", { sessionId: binding.nativeSessionId });
         cancelTimer ??= setTimeout(
@@ -1140,7 +1259,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
       try {
         const cwd = agent.session.header.cwd;
         if (!cwd) throw new Error("请先选择工作区。");
-        rpc = this.connection(cwd);
+        rpc = reuse?.rpc ?? this.connection(cwd);
         const updates = new NativeSessionUpdates((type, data) =>
           this.writeRecord(agent.session, type, data),
         );
@@ -1152,6 +1271,12 @@ export class GoogleAcpAdapter extends LlmAdapter {
           (type, data) => this.writeRecord(agent.session, type, data),
         );
         let response = "";
+        const notify = rpc.onNotification;
+        const request = rpc.onRequest;
+        restore = () => {
+          rpc!.onNotification = notify;
+          rpc!.onRequest = request;
+        };
         rpc.onNotification = (method, params) => {
           if (method !== "session/update") return;
           updates.receive(params);
@@ -1159,6 +1284,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
           const u = params.update;
           const compaction = updates.compaction(u);
           if (compaction) recorder.update(compaction);
+          else if (reuse && !["agent_message_chunk", "usage_update", "available_commands_update"].includes(u?.sessionUpdate)) notify(method, params);
           if (
             u?.sessionUpdate === "agent_message_chunk" &&
             u.content?.type === "text"
@@ -1167,15 +1293,19 @@ export class GoogleAcpAdapter extends LlmAdapter {
         };
         // Compression needs no tool execution. Unexpected permission requests fail closed.
         rpc.onRequest = async () => ({ outcome: { outcome: "cancelled" } });
-        const init = await this.initialize(rpc);
-        abort.throwIfAborted();
-        if (!init.agentCapabilities?.sessionCapabilities?.resume)
-          throw new Error("官方 ACP 不支持恢复会话，未发送压缩请求。");
-        await rpc.request("session/resume", {
-          cwd,
-          mcpServers: [],
-          sessionId: binding.nativeSessionId,
-        });
+        if (reuse) {
+          updates.commands = this.projection.stateOf(agent.session).native?.commands ?? null;
+        } else {
+          const init = await this.initialize(rpc);
+          abort.throwIfAborted();
+          if (!init.agentCapabilities?.sessionCapabilities?.resume)
+            throw new Error("官方 ACP 不支持恢复会话，未发送压缩请求。");
+          await rpc.request("session/resume", {
+            cwd,
+            mcpServers: [],
+            sessionId: binding.nativeSessionId,
+          });
+        }
         updates.bind(binding.nativeSessionId);
         await updates.requireCommand("compact", abort);
         abort.throwIfAborted();
@@ -1213,8 +1343,11 @@ export class GoogleAcpAdapter extends LlmAdapter {
         if (started) cancel();
         abort.removeEventListener("abort", cancel);
         clearTimeout(cancelTimer);
-        rpc?.close();
-        if (rpc) this.connections.delete(rpc);
+        if (reuse && !started && !abort.aborted) restore?.();
+        else {
+          rpc?.close();
+          if (rpc) this.connections.delete(rpc);
+        }
         this.active.delete(agent.id);
       }
     });
@@ -1353,6 +1486,7 @@ export async function apply(ctx: any, config: ConfigValue) {
     });
     return next();
   });
+  ctx.on("agent/disposed", ({ agent }: any) => adapter.closeSession(agent));
   ctx.on("dispose", () => adapter.dispose());
   ctx.on("dispose", () => projection.dispose());
   ctx.inject(["commands"], (ready: any) => {
@@ -1365,6 +1499,7 @@ export async function apply(ctx: any, config: ConfigValue) {
             kind: "error",
             text: "请先停止当前任务，再重置 ACP 上下文。",
           };
+        adapter.closeSession(agent);
         writeRecord(agent.session, ACP_BINDING, { reset: true });
         return {
           kind: "success",

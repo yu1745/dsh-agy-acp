@@ -13,7 +13,8 @@ export const appendAcpRecord: SessionRecordWriter = (session, type, data) =>
 
 /** Keep the profile loader's Session identity for private record commits. */
 export async function hostAcpRecordWriter(): Promise<SessionRecordWriter> {
-  return appendAcpRecord;
+  const { appendPluginRecord: write } = await hostModule("@deepseek-ai/dsh-session");
+  return write;
 }
 
 /** Use the running harness's package version, including its class identities. */

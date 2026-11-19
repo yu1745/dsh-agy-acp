@@ -504,6 +504,55 @@ test("background tools and model output can settle after ACP end_turn", async ()
     h.adapter.dispose();
   }
 });
+test("background calls remain in progress after the DSH foreground deadline", async () => {
+  const h = harness("background-after-end-turn-timeout");
+  h.adapter.config.requestTimeoutMs = 1000;
+  try {
+    await collect(h.adapter.stream(h.options));
+    h.agent.session.append("turn/end", { turn: 1, reason: { kind: "completed" } });
+    assert.equal(h.state().calls.find((call) => call.id === "background").status, "in_progress");
+    assert.equal(h.state().runningTurn, null);
+    assert.equal(h.adapter.connections.size, 1);
+  } finally {
+    h.adapter.dispose();
+  }
+});
+
+test("a completed monitor can wake an idle session on the retained transport and use the existing grant", async () => {
+  const h = harness("idle-wake");
+  h.ctx.get = (name) => name === "permissionPresets" ? {
+    current: () => "danger-full-access",
+    resolve: () => ({ sandbox: "danger-full-access", approval: "never" }),
+  } : undefined;
+  const first = await collect(h.adapter.stream(h.options));
+  assert.ok(first.some((item) => item.type === "text-delta" && item.text === "Monitor registered."));
+  h.agent.session.append("turn/end", { turn: 1, reason: { kind: "completed" } });
+  try {
+    const settled = new Promise((resolve, reject) => {
+      const append = h.agent.session.append;
+      const timer = setTimeout(() => reject(new Error("The monitor did not wake")), 2000);
+      h.agent.session.append = (type, data) => {
+        const record = append.call(h.agent.session, type, data);
+        if (type === ACP_MESSAGE && data.end === "settled") {
+          clearTimeout(timer);
+          resolve(record);
+        }
+        return record;
+      };
+    });
+    await settled;
+    assert.ok(h.events.some((event) => event.type === ACP_MESSAGE && event.data.delta === "Monitor woke."));
+    const resumedTool = h.state().calls.find((call) => call.id === "wake-read");
+    assert.equal(resumedTool.status, "completed");
+    assert.equal(resumedTool.permission.outcome, "allowed-once");
+    assert.equal(h.state().runningTurn, null);
+    const next = { id: "next-task", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "next task" }] };
+    const chunks = await collect(h.adapter.stream({ ...h.options, messages: [...h.options.messages, next] }));
+    assert.ok(chunks.some((item) => item.type === "text-delta" && item.text === "Same transport."));
+  } finally {
+    h.adapter.dispose();
+  }
+});
 test("ACP forms return multiple option IDs alongside custom text and handle cancellation", async () => {
   for (const cancelled of [false, true]) {
     const h = harness("elicitation");

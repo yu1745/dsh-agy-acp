@@ -40,6 +40,9 @@ export class DshMcpBridge {
     public tools: any[],
     private invoke: (name: string, args: any) => Promise<any>,
   ) {}
+  setInvoker(invoke: (name: string, args: any) => Promise<any>) {
+    this.invoke = invoke;
+  }
   async start() {
     this.directory = await mkdtemp(join(tmpdir(), "web-tools-mcp-"));
     await copyFile(

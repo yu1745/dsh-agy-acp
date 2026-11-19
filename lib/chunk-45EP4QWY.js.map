@@ -1,7 +1,0 @@
-{
-  "version": 3,
-  "sources": ["../src/google-acp-records.ts"],
-  "sourcesContent": ["import { createRequire } from \"node:module\";\nimport { isAbsolute } from \"node:path\";\nimport { pathToFileURL } from \"node:url\";\nimport { appendPluginRecord } from \"@deepseek-ai/dsh-session\";\n\nexport type SessionRecordWriter = (\n  session: any,\n  type: string,\n  data: any,\n) => unknown;\nexport const appendAcpRecord: SessionRecordWriter = (session, type, data) =>\n  (appendPluginRecord as SessionRecordWriter)(session, type, data);\n\n/** Keep the profile loader's Session identity for private record commits. */\nexport async function hostAcpRecordWriter(): Promise<SessionRecordWriter> {\n  return appendAcpRecord;\n}\n\n/** Use the running harness's package version, including its class identities. */\nexport async function hostModule(name: string): Promise<any> {\n  const entry = process.argv[1];\n  const require = createRequire(\n    entry && isAbsolute(entry) ? pathToFileURL(entry) : import.meta.url,\n  );\n  return import(pathToFileURL(require.resolve(name)).href);\n}\n"],
-  "mappings": ";AAAA,SAAS,qBAAqB;AAC9B,SAAS,kBAAkB;AAC3B,SAAS,qBAAqB;AAC9B,SAAS,0BAA0B;AAO5B,IAAM,kBAAuC,CAAC,SAAS,MAAM,SACjE,mBAA2C,SAAS,MAAM,IAAI;AAGjE,eAAsB,sBAAoD;AACxE,SAAO;AACT;AAGA,eAAsB,WAAW,MAA4B;AAC3D,QAAM,QAAQ,QAAQ,KAAK,CAAC;AAC5B,QAAMA,WAAU;AAAA,IACd,SAAS,WAAW,KAAK,IAAI,cAAc,KAAK,IAAI,YAAY;AAAA,EAClE;AACA,SAAO,OAAO,cAAcA,SAAQ,QAAQ,IAAI,CAAC,EAAE;AACrD;",
-  "names": ["require"]
-}

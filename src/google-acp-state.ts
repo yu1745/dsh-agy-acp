@@ -49,6 +49,7 @@ export const nativeToolSchema = z.object({
   startedAt: z.number(),
   updatedAt: z.number(),
   endedAt: z.number().optional(),
+  survivesHostTurn: z.boolean().optional(),
 });
 export type NativeTool = z.infer<typeof nativeToolSchema>;
 export type AcpState = {
@@ -86,7 +87,7 @@ export function foldAcpState(state: AcpState, event: any): AcpState {
     const calls = [...state.calls];
     if (index < 0) calls.push(call);
     else calls[index] = call;
-    return { ...state, calls, runningTurn: call.turn };
+    return { ...state, calls, runningTurn: call.survivesHostTurn ? state.runningTurn : call.turn };
   }
   if (event.type !== "turn/end") return state;
   const turn = event.data.turn;
@@ -94,7 +95,7 @@ export function foldAcpState(state: AcpState, event: any): AcpState {
     event.data.reason?.kind === "completed" ? "incomplete" : "cancelled";
   let changed = state.runningTurn === turn;
   const calls = state.calls.map((c) => {
-    if (c.turn !== turn || c.endedAt !== undefined) return c;
+    if (c.turn !== turn || c.endedAt !== undefined || c.survivesHostTurn) return c;
     changed = true;
     return { ...c, status, endedAt: event.time, updatedAt: event.time };
   });
@@ -165,9 +166,8 @@ export function isWaitableBackgroundCall(call: NativeTool): boolean {
   )
     return false;
   const input = call.rawInput;
+  if (call.kind === "execute") return true;
   if (!isPlainObject(input)) return false;
-  if (call.kind === "execute" && (typeof input.CommandLine === "string" || typeof input.command === "string"))
-    return true;
   if (typeof input.Script === "string" || typeof input.ScriptPath === "string")
     return true;
   if (typeof input.DurationSeconds === "number") return true;
@@ -208,6 +208,7 @@ export class NativeToolRecorder {
       ...(old ?? {}),
     };
     call.updatedAt = now;
+    if (this.detached) call.survivesHostTurn = true;
     if (origin === "DSH · MCP" || old?.origin === "DSH · MCP")
       call.origin = "DSH · MCP";
     for (const key of ["title", "status", "kind"] as const)
@@ -238,13 +239,21 @@ export class NativeToolRecorder {
     this.writeRecord(ACP_EVENT, { ...call, step: this.step });
     return call;
   }
+  private detached = false;
+  preserveAfterTurn() {
+    this.detached = true;
+    for (const call of this.calls.values()) {
+      if (call.endedAt === undefined) this.update({ toolCallId: call.id });
+    }
+  }
+  has(id: string): boolean {
+    return this.calls.has(id);
+  }
   hasActiveBackgroundCalls(): boolean {
     return [...this.calls.values()].some(isWaitableBackgroundCall);
   }
-  hasUnsettledCalls(): boolean {
-    return [...this.calls.values()].some(
-      (c) => c.endedAt === undefined && !isDaemonToolCall(c),
-    );
+  hasOpenCalls(): boolean {
+    return [...this.calls.values()].some((call) => call.endedAt === undefined);
   }
   finish(status: "incomplete" | "cancelled" | "failed") {
     for (const call of this.calls.values())
