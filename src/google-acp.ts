@@ -10,8 +10,13 @@ import z from "@deepseek-ai/schemastery";
 import { randomUUID, createHash } from "node:crypto";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { AcpConnection, AcpRpcError } from "./google-acp-rpc.js";
+import {
+  buildAcpElicitationResponse,
+  isUserQuestionCancellation,
+  parseAcpElicitation,
+} from "./google-acp-elicitation.js";
 import { acpTokenUsage } from "./google-acp-usage.js";
 import { ACP_NOTICE, NativeSessionUpdates } from "./google-acp-session.js";
 import {
@@ -249,7 +254,10 @@ export class GoogleAcpAdapter extends LlmAdapter {
   private async initialize(rpc: AcpConnection) {
     const init = await rpc.request("initialize", {
       protocolVersion: 1,
-      clientCapabilities: { session: { compaction: {}, notices: {} } },
+      clientCapabilities: {
+        session: { compaction: {}, notices: {} },
+        ...(this.ctx.get("userQuestions") ? { elicitation: { form: {} } } : {}),
+      },
       clientInfo: {
         name: "google-acp-extension",
         title: "Google ACP Extension",
@@ -426,7 +434,7 @@ export class GoogleAcpAdapter extends LlmAdapter {
         "No new messages to send to the official ACP agent.",
         "ACP_EMPTY",
       );
-    const anchor = options.messages.at(-1)?.id ?? null;
+    const anchor = options.messages.findLast(isUserTask)?.id ?? null;
     if (!anchor)
       throw new LlmError(
         "ACP session messages require durable identities.",
@@ -482,6 +490,25 @@ export class GoogleAcpAdapter extends LlmAdapter {
       const init = await this.initialize(rpc);
       controller.signal.throwIfAborted();
       const prompt = await this.preparePrompt(pending, controller.signal);
+      const invokedSkills = new Set(options.messages.flatMap((message) => {
+        const source = message.role === "user" ? message.source as { kind?: string; name?: string } | undefined : undefined;
+        return source?.kind === "skill-invocation" && source.name ? [source.name] : [];
+      }));
+      const skills = this.ctx.get("skills");
+      if (skills && invokedSkills.size) {
+        for (const block of prompt) {
+          if (block.type !== "text") continue;
+          const name = /^\/([a-z0-9]+(?:-[a-z0-9]+)*)(?=\s|$)/.exec(block.text)?.[1];
+          if (!name || !invokedSkills.has(name)) continue;
+          const skill = await skills.get(name, { cwd, scope: agent, signal: controller.signal });
+          controller.signal.throwIfAborted();
+          const base = skill?.resourceBase;
+          if (!skill?.invocation.userInvocable || base?.kind !== "directory" || !isAbsolute(base.path)) continue;
+          const path = join(base.path, "SKILL.md");
+          if (!(await stat(path).catch(() => undefined))?.isFile()) continue;
+          block.text = `Read the DSH skill instructions at ${JSON.stringify(path)} and follow them for this invocation.\n\n${block.text}`;
+        }
+      }
       if (!prompt.length)
         throw new LlmError(
           "No user task to send to the official ACP agent.",
@@ -682,6 +709,39 @@ export class GoogleAcpAdapter extends LlmAdapter {
         }
       };
       rpc.onRequest = async (method, params) => {
+        if (method === "elicitation/create" && params?.sessionId === nativeSessionId) {
+          const plan = parseAcpElicitation(params);
+          const service = this.ctx.get("userQuestions");
+          if (!plan || !service || controller.signal.aborted)
+            return { action: "cancel" };
+          const toolCallId = params.toolCallId;
+          const track = (status: string) => {
+            if (typeof toolCallId === "string" && toolCallId) {
+              messageRecorder!.tool(toolCallId);
+              recorder!.update({ toolCallId, status });
+            }
+          };
+          track("waiting_input");
+          try {
+            const answer = await service.ask({
+              agent,
+              signal: controller.signal,
+              questions: plan.questions,
+            });
+            const result = controller.signal.aborted
+              ? { action: "cancel" }
+              : buildAcpElicitationResponse(plan, answer);
+            track(result.action === "accept" ? "in_progress" : "cancelled");
+            return result;
+          } catch (error) {
+            if (controller.signal.aborted || isUserQuestionCancellation(error)) {
+              track("cancelled");
+              return { action: "cancel" };
+            }
+            track("failed");
+            throw error;
+          }
+        }
         if (
           method !== "session/request_permission" ||
           params?.sessionId !== nativeSessionId
@@ -907,6 +967,34 @@ export class GoogleAcpAdapter extends LlmAdapter {
             } while (size !== steering.size);
             stopSteering?.();
             stopSteering = undefined;
+            if (result?.stopReason === "end_turn" && recorder?.hasActiveBackgroundCalls() && !controller.signal.aborted) {
+              await new Promise<void>((resolve) => {
+                const connection = rpc!;
+                const onNotification = connection.onNotification;
+                let quiet: ReturnType<typeof setTimeout> | undefined;
+                const finish = () => {
+                  clearTimeout(deadline);
+                  clearTimeout(quiet);
+                  connection.onNotification = onNotification;
+                  connection.onClose = previousClose;
+                  controller.signal.removeEventListener("abort", finish);
+                  resolve();
+                };
+                const deadline = setTimeout(finish, this.config.requestTimeoutMs);
+                const previousClose = connection.onClose;
+                connection.onClose = (error) => {
+                  finish();
+                  previousClose(error);
+                };
+                controller.signal.addEventListener("abort", finish, { once: true });
+                connection.onNotification = (method, params) => {
+                  onNotification(method, params);
+                  if (method !== "session/update" || params?.sessionId !== nativeSessionId) return;
+                  clearTimeout(quiet);
+                  if (!recorder?.hasActiveBackgroundCalls()) quiet = setTimeout(finish, 1000);
+                };
+              });
+            }
             queue.push({ type: "done", result });
           } catch (error) {
             queue.push({ type: "error", error });

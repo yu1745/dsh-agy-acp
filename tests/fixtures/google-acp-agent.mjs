@@ -25,12 +25,20 @@ const availableModels =
 let selectedModel = availableModels[0]?.modelId;
 lines.on("line", async (line) => {
   const m = JSON.parse(line);
+  if (m.id === "elicitation-1") {
+    update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: JSON.stringify(m.result ?? m.error) } });
+    send({ id: pendingPrompt.id, result: { stopReason: "end_turn" } });
+    pendingPrompt = null;
+    return;
+  }
   if (m.id === "permission-1") {
     permission?.(m.result);
     return;
   }
   const result = (value) => send({ id: m.id, result: value });
   if (m.method === "initialize") {
+    if (scenario === "elicitation" && !m.params.clientCapabilities?.elicitation?.form)
+      return process.exit(20);
     if (scenario === "catalog-hang") {
       send({ method: "test/catalog-waiting", params: {} });
       return;
@@ -115,6 +123,38 @@ lines.on("line", async (line) => {
       return;
     }
     pendingPrompt = m;
+    if (scenario === "background-after-end-turn") {
+      update({ sessionUpdate: "tool_call", toolCallId: "background", kind: "execute", status: "in_progress", rawInput: { command: "fixture" } });
+      update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Still running. " } });
+      result({ stopReason: "end_turn" });
+      setTimeout(() => {
+        update({ sessionUpdate: "tool_call_update", toolCallId: "background", status: "completed" });
+        update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done." } });
+      }, 50);
+      return;
+    }
+    if (scenario === "elicitation") {
+      send({
+        id: "elicitation-1",
+        method: "elicitation/create",
+        params: {
+          sessionId: "native-session",
+          mode: "form",
+          requestedSchema: {
+            type: "object",
+            properties: {
+              q1: {
+                type: "array",
+                title: "Pick toppings",
+                items: { anyOf: [{ const: "1", title: "Cheese" }, { const: "2", title: "Olives" }] },
+              },
+              q1_other: { type: "string" },
+            },
+          },
+        },
+      });
+      return;
+    }
     if (
       scenario.startsWith("session-") &&
       m.params.prompt[0]?.text === "/compact"

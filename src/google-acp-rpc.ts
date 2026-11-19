@@ -27,6 +27,7 @@ export class AcpConnection {
   onRequest: (method: string, params: any) => Promise<any> = async () => {
     throw new AcpRpcError("Unsupported client request", -32601);
   };
+  onClose: (error: Error) => void = () => {};
   constructor(
     command: string,
     args: string[],
@@ -162,6 +163,7 @@ export class AcpConnection {
       p.reject(error);
     }
     this.pending.clear();
+    this.onClose(error);
   }
   close(error: Error = new AcpRpcError("ACP connection closed.")) {
     this.fail(error);

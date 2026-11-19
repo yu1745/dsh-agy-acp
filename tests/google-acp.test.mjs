@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   GoogleAcpAdapter,
   messagesAfterAnchor,
@@ -491,6 +494,39 @@ test("native choice questions return the exact human-selected option rather than
     h.adapter.dispose();
   }
 });
+test("background tools and model output can settle after ACP end_turn", async () => {
+  const h = harness("background-after-end-turn");
+  try {
+    const chunks = await collect(h.adapter.stream(h.options));
+    assert.equal(chunks.filter((chunk) => chunk.type === "text-delta").map((chunk) => chunk.text).join(""), "Still running. Done.");
+    assert.equal(h.state().calls.find((call) => call.id === "background").status, "completed");
+  } finally {
+    h.adapter.dispose();
+  }
+});
+test("ACP forms return multiple option IDs alongside custom text and handle cancellation", async () => {
+  for (const cancelled of [false, true]) {
+    const h = harness("elicitation");
+    h.ctx.get = (name) => name === "userQuestions" ? {
+      ask: async ({ questions }) => {
+        assert.equal(questions.length, 1);
+        assert.equal(questions[0].multiSelect, true);
+        if (cancelled) throw Object.assign(new Error("Cancelled"), { code: "ASK_CANCELLED" });
+        return { answers: [{ id: "q1", selected: ["Cheese", "Olives"], custom: "Basil" }] };
+      },
+    } : undefined;
+    try {
+      const chunks = await collect(h.adapter.stream(h.options));
+      const response = chunks.filter((chunk) => chunk.type === "text-delta")
+        .map((chunk) => chunk.text).join("");
+      assert.deepEqual(JSON.parse(response), cancelled
+        ? { action: "cancel" }
+        : { action: "accept", content: { q1: ["1", "2"], q1_other: "Basil" } });
+    } finally {
+      h.adapter.dispose();
+    }
+  }
+});
 test("official account suspension text is a non-retryable account error, not successful work", async () => {
   const h = harness("disabled");
   try {
@@ -976,6 +1012,34 @@ test("config-option model ids disambiguate variants even when display labels omi
     ["model"],
   );
   assert.equal(resolveAcpModelSelection(session, "model"), "model-high");
+});
+test("explicit DSH skill invocations send the file path and arguments to ACP", async () => {
+  const h = harness("echo-prompt");
+  const directory = await mkdtemp(join(tmpdir(), "dsh-acp-skill-"));
+  const path = join(directory, "SKILL.md");
+  await writeFile(path, "Private skill body");
+  h.ctx.get = (name) => name === "skills" ? {
+    get: async () => ({
+      invocation: { userInvocable: true },
+      resourceBase: { kind: "directory", path: directory },
+    }),
+  } : undefined;
+  const user = { id: "skill-task", role: "user", source: { kind: "user" },
+    content: [{ type: "text", text: "/example argument" }] };
+  const invocation = { id: "injected-skill", role: "user",
+    source: { kind: "skill-invocation", name: "example" },
+    content: [{ type: "text", text: "Private skill body" }] };
+  try {
+    const chunks = await collect(h.adapter.stream({ ...h.options, messages: [user, invocation] }));
+    const text = chunks.filter((c) => c.type === "text-delta").map((c) => c.text).join("");
+    const [block] = JSON.parse(text);
+    assert.ok(block.text.includes(JSON.stringify(path)));
+    assert.ok(block.text.endsWith("/example argument"));
+    assert.ok(!block.text.includes("Private skill body"));
+    assert.equal(h.state().binding.anchor, user.id);
+  } finally {
+    h.adapter.dispose();
+  }
 });
 test("fresh ACP sessions receive only the current user task, without system append or generated harness context", async () => {
   const h = harness("echo-prompt");

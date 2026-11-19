@@ -138,6 +138,42 @@ export const acpProjection = {
   },
 };
 
+const TERMINAL_TOOL_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "incomplete",
+]);
+
+export function isTerminalToolStatus(status: unknown): boolean {
+  return typeof status === "string" && TERMINAL_TOOL_STATUSES.has(status);
+}
+
+const isPlainObject = (value: unknown): value is Record<string, any> =>
+  Boolean(value) && typeof value === "object" && !Array.isArray(value);
+
+export function isDaemonToolCall(call: NativeTool): boolean {
+  return isPlainObject(call.rawInput) && call.rawInput.IsDaemon === true;
+}
+
+export function isWaitableBackgroundCall(call: NativeTool): boolean {
+  if (
+    call.origin !== "Antigravity" ||
+    call.status !== "in_progress" ||
+    call.endedAt !== undefined ||
+    isDaemonToolCall(call)
+  )
+    return false;
+  const input = call.rawInput;
+  if (!isPlainObject(input)) return false;
+  if (call.kind === "execute" && (typeof input.CommandLine === "string" || typeof input.command === "string"))
+    return true;
+  if (typeof input.Script === "string" || typeof input.ScriptPath === "string")
+    return true;
+  if (typeof input.DurationSeconds === "number") return true;
+  return false;
+}
+
 function bounded(value: unknown): unknown {
   const encoded = JSON.stringify(value);
   if (encoded === undefined) return undefined;
@@ -196,13 +232,19 @@ export class NativeToolRecorder {
             omittedEntries: update[key].length - 256,
           });
       }
-    if (
-      ["completed", "failed", "cancelled", "incomplete"].includes(call.status)
-    )
-      call.endedAt ??= now;
+    if (isTerminalToolStatus(call.status)) call.endedAt ??= now;
+    else delete call.endedAt;
     this.calls.set(call.id, call);
     this.writeRecord(ACP_EVENT, { ...call, step: this.step });
     return call;
+  }
+  hasActiveBackgroundCalls(): boolean {
+    return [...this.calls.values()].some(isWaitableBackgroundCall);
+  }
+  hasUnsettledCalls(): boolean {
+    return [...this.calls.values()].some(
+      (c) => c.endedAt === undefined && !isDaemonToolCall(c),
+    );
   }
   finish(status: "incomplete" | "cancelled" | "failed") {
     for (const call of this.calls.values())
